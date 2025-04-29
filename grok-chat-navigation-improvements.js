@@ -2,7 +2,7 @@
 // @name         Grok Chat Navigation Improvements
 // @namespace    http://tampermonkey.net/
 // @license      MIT
-// @version      1.0
+// @version      1.2
 // @description Keyboard navigation and message interaction for Grok chat
 // @author       cdr-x
 // @match        https://grok.com/*
@@ -156,9 +156,21 @@
     }
 
     // ### Keyboard Event Listener
+    let lastEndKeyTime = 0;
+    let lastHomeKeyTime = 0;
     document.addEventListener('keydown', (event) => {
         const boxes = getMessageBoxes();
         if (!boxes.length) return;
+
+        // Ctrl+I focuses the main chat input box
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'i') {
+            const inputBox = document.querySelector('div.absolute.bottom-0 textarea');
+            if (inputBox) {
+                inputBox.focus();
+                event.preventDefault();
+                return;
+            }
+        }
 
         const editing = isEditingMessage();
 
@@ -178,21 +190,60 @@
                     event.preventDefault();
                 }
             } else if (event.key === 'Escape') {
-                const messageBox = boxes[selectedIdx];
-                const cancelButton = Array.from(messageBox.querySelectorAll('button')).find(btn =>
-                    btn.textContent.trim().includes('Cancel')
-                );
-                if (cancelButton) {
-                    cancelButton.click();
-                    event.preventDefault();
-                    setTimeout(() => {
-                        highlightSelected({ scrollIntoView: false });
-                    }, 100);
+                // Robustly find the cancel button after the textarea
+                const textarea = document.activeElement;
+                if (textarea && textarea.tagName.toLowerCase() === 'textarea') {
+                    // Find the closest message box
+                    const messageBox = textarea.closest('div.relative.group.flex.flex-col');
+                    // Find the button group after the textarea
+                    let cancelButton = null;
+                    if (messageBox) {
+                        // Find the parent of textarea, then the next sibling div with buttons
+                        let parent = textarea.parentElement;
+                        while (parent && parent !== messageBox && !cancelButton) {
+                            let sibling = parent.nextElementSibling;
+                            while (sibling && !cancelButton) {
+                                // Look for a div with flex-row and buttons
+                                if (sibling.matches && sibling.matches('div.flex.flex-row')) {
+                                    const btns = Array.from(sibling.querySelectorAll('button'));
+                                    if (btns.length > 0) {
+                                        cancelButton = btns[0]; // First button is always cancel
+                                        break;
+                                    }
+                                }
+                                sibling = sibling.nextElementSibling;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    if (!cancelButton && messageBox) {
+                        // Fallback: look for any visible button with 2+ buttons after textarea
+                        const btns = Array.from(messageBox.querySelectorAll('textarea ~ div button'));
+                        if (btns.length > 0) cancelButton = btns[0];
+                    }
+                    if (cancelButton) {
+                        cancelButton.click();
+                        event.preventDefault();
+                        setTimeout(() => {
+                            highlightSelected({ scrollIntoView: false });
+                        }, 100);
+                    }
                 }
             }
             return;
         } else {
             if (event.key === 'Escape') {
+                const ae = document.activeElement;
+                // If in chat input box (bottom input area), defocus and select previously selected message
+                if (ae && ae.tagName.toLowerCase() === 'textarea' && isInTextInputMode()) {
+                    ae.blur();
+                    if (window._grokPrevSelectedIdx !== undefined && window._grokPrevSelectedIdx >= 0 && window._grokPrevSelectedIdx < boxes.length) {
+                        selectedIdx = window._grokPrevSelectedIdx;
+                        highlightSelected({ scrollIntoView: true });
+                    }
+                    event.preventDefault();
+                    return;
+                }
                 const aside = document.querySelector('aside');
                 if (aside && aside.offsetParent !== null) {
                     const closeButton = aside.querySelector('div.flex.justify-end > button');
@@ -219,20 +270,38 @@
                 }
             } else if (!isInTextInputMode()) {
                 if (event.key === 'Home') {
+                    const now = Date.now();
                     if (selectedIdx === -1) {
                         selectedIdx = 0;
                         highlightSelected({ scrollIntoView: true });
                     } else {
-                        boxes[selectedIdx].scrollIntoView({ block: 'start', behavior: 'smooth' });
+                        // Double-tap Home: if within 2s, go to first message
+                        if (now - lastHomeKeyTime < 2000) {
+                            selectedIdx = 0;
+                            highlightSelected({ scrollIntoView: true });
+                            boxes[0].scrollIntoView({ block: 'start', behavior: 'smooth' });
+                        } else {
+                            boxes[selectedIdx].scrollIntoView({ block: 'start', behavior: 'smooth' });
+                        }
+                        lastHomeKeyTime = now;
                     }
                     event.preventDefault();
                 } else if (event.key === 'End') {
+                    const now = Date.now();
                     if (selectedIdx === -1) {
                         selectedIdx = boxes.length - 1;
                         highlightSelected();
                         scrollSelectedToBottom15();
                     } else {
-                        scrollSelectedToBottom15();
+                        // Double-tap End: if within 2s, go to last message
+                        if (now - lastEndKeyTime < 2000) {
+                            selectedIdx = boxes.length - 1;
+                            highlightSelected({ scrollIntoView: true });
+                            scrollSelectedToBottom15();
+                        } else {
+                            scrollSelectedToBottom15();
+                        }
+                        lastEndKeyTime = now;
                     }
                     event.preventDefault();
                 } else if (event.key === 'j' || event.key === 'ArrowDown') {
@@ -255,27 +324,59 @@
                     event.preventDefault();
                 } else if (selectedIdx >= 0) {
                     const box = boxes[selectedIdx];
+                    // Robustly find the edit/copy/regenerate buttons regardless of language
+                    const visibleButtons = Array.from(box.querySelectorAll('button')).filter(btn => btn.offsetParent !== null);
                     if (event.key === 'e' && !event.ctrlKey) {
-                        const editButton = box.querySelector('button[aria-label="Edit"]');
-                        if (editButton) {
-                            editButton.click();
+                        // Select the first visible button (Edit)
+                        if (visibleButtons.length > 0) {
+                            visibleButtons[0].click();
                             event.preventDefault();
                         }
                     } else if (event.key === 'c' && !event.ctrlKey) {
-                        const copyButton = box.querySelector('button[aria-label="Copy"]');
-                        if (copyButton) {
-                            copyButton.click();
+                        // Try to find the copy button by aria-label or icon
+                        let copyBtn = visibleButtons.find(btn => {
+                            const label = btn.getAttribute('aria-label') || '';
+                            return /copy|コピー|копировать|copier|kopieren|copia/i.test(label);
+                        });
+                        if (!copyBtn) {
+                            // Fallback: if regenerate button exists, try next button
+                            let regenIdx = visibleButtons.findIndex(btn => {
+                                const label = btn.getAttribute('aria-label') || '';
+                                return /regenerate|再生成|再生成|regenerar|erneuern|regenerieren/i.test(label);
+                            });
+                            if (regenIdx !== -1 && visibleButtons[regenIdx + 1]) {
+                                copyBtn = visibleButtons[regenIdx + 1];
+                            }
+                        }
+                        if (copyBtn) {
+                            copyBtn.click();
                             event.preventDefault();
                         }
                     } else if (event.key === 'r' && !event.ctrlKey) {
-                        const regenerateButton = box.querySelector('button[aria-label="Regenerate"]');
-                        if (regenerateButton) {
-                            regenerateButton.click();
+                        // Try to find the regenerate button by aria-label or icon
+                        let regenBtn = visibleButtons.find(btn => {
+                            const label = btn.getAttribute('aria-label') || '';
+                            return /regenerate|再生成|再生成|regenerar|erneuern|regenerieren/i.test(label);
+                        });
+                        if (!regenBtn) {
+                            // Fallback: look for a button with a refresh/rotate icon
+                            regenBtn = visibleButtons.find(btn => {
+                                const svg = btn.querySelector('svg');
+                                if (!svg) return false;
+                                return /rotate|refresh|regenerate|arrow/i.test(svg.outerHTML);
+                            });
+                        }
+                        if (regenBtn) {
+                            regenBtn.click();
                             event.preventDefault();
                         }
                     }
                 }
             }
+        }
+        // Track previous selectedIdx for chat input Escape
+        if (!isInTextInputMode()) {
+            window._grokPrevSelectedIdx = selectedIdx;
         }
     });
 
