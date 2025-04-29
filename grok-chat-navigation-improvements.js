@@ -275,8 +275,8 @@
                         selectedIdx = 0;
                         highlightSelected({ scrollIntoView: true });
                     } else {
-                        // Double-tap Home: if within 2s, go to first message
-                        if (now - lastHomeKeyTime < 2000) {
+                        // Double-tap Home: if within 800 ms, go to first message
+                        if (now - lastHomeKeyTime < 800) {
                             selectedIdx = 0;
                             highlightSelected({ scrollIntoView: true });
                             boxes[0].scrollIntoView({ block: 'start', behavior: 'smooth' });
@@ -293,8 +293,8 @@
                         highlightSelected();
                         scrollSelectedToBottom15();
                     } else {
-                        // Double-tap End: if within 2s, go to last message
-                        if (now - lastEndKeyTime < 2000) {
+                        // Double-tap End: if within 800 ms, go to last message
+                        if (now - lastEndKeyTime < 800) {
                             selectedIdx = boxes.length - 1;
                             highlightSelected({ scrollIntoView: true });
                             scrollSelectedToBottom15();
