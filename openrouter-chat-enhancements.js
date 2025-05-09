@@ -2,7 +2,7 @@
 // @name         OpenRouter Chat Enhancements
 // @namespace    http://tampermonkey.net/
 // @license      MIT
-// @version      1.3.0
+// @version      1.4.0
 // @description  Navigation hotkeys, message highlight, floating speaker, scroll protections, perfect collapse/expand handling, and enhanced edit scroll lock.
 // @author       cdr-x
 // @match        https://openrouter.ai/chat*
@@ -71,7 +71,7 @@
         }
 
         // Remove the commented out createSpeakerFloat method entirely since it's no longer needed
-
+        
         createPanel() {
             this.clearPanel();
             if (!this.settings || !this.settings.panelEnabled) return;
@@ -315,9 +315,26 @@
 
         refreshActiveMsg() {
             if (!this.highlighted) return;
-            const refreshSvg = this.highlighted.querySelector('svg path[d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99"]');
-            if (refreshSvg) {
-                refreshSvg.closest('button').click();
+            // Use the full SVG path selector from old script for refresh button
+            const refreshSelectors = [
+                'svg path[d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99"]',
+                'button[aria-label="Refresh"]',
+                'button[title="Refresh"]',
+                'button svg[viewBox="0 0 24 24"] path[d*="M17.65 6.35A10 10 0 1 1 6.35 17.65"]',
+                'button svg[viewBox="0 0 24 24"] path[d*="M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1-18 0z"]'
+            ];
+
+            let refreshButton = null;
+            for (const selector of refreshSelectors) {
+                const el = this.highlighted.querySelector(selector);
+                if (el) {
+                    refreshButton = el.closest('button') || el;
+                    break;
+                }
+            }
+
+            if (refreshButton) {
+                refreshButton.click();
             }
         }
 
@@ -426,10 +443,14 @@
                 if (this.editPasteProhibit && this.lastEditingMsg) {
                     this.ensureScrollInBounds(this.lastEditingMsg);
                 }
-                const active = document.activeElement;
-                if (active && (active.matches('input, textarea, [contenteditable]'))) {
-                    active.blur();
-                }
+            }, { passive: true });
+
+            // Add wheel event listener to allow mouse wheel scrolling without interference
+            this.scrollContainer.addEventListener('wheel', (e) => {
+                // Do not blur or interfere with scrolling on wheel
+                // Just allow the event to propagate normally
+                // This prevents any focus blur that might block scrolling
+                e.stopPropagation();
             }, { passive: true });
         }
 
@@ -571,6 +592,62 @@
             this.navigation = navigation;
             this.ui = ui;
             this.lastFocusedMsg = null;
+
+            this.patchedRetry = null;
+            this.patchRetryFunction();
+        }
+
+        patchRetryFunction() {
+            // Wait for the React context or message dispatch to be available
+            const tryPatch = () => {
+                try {
+                    // Access the message dispatch from the navigation or ui
+                    // Heuristic: navigation has a messages object with a dispatch method
+                    if (this.navigation && this.navigation.ui && this.navigation.ui.messageDispatch) {
+                        const dispatch = this.navigation.ui.messageDispatch;
+                        if (dispatch && dispatch.retry && !dispatch.retry.__patched) {
+                            const originalRetry = dispatch.retry;
+                            const self = this;
+                            dispatch.retry = async function(message, options) {
+                                // Ignore isProcessing flag by not checking it
+                                // Just call the original retry
+                                return originalRetry.call(this, message, options);
+                            };
+                            dispatch.retry.__patched = true;
+                            this.patchedRetry = dispatch.retry;
+                            return true;
+                        }
+                    }
+                    // Fallback: try to find global retry function
+                    if (window && window.__RETRY_FUNCTION__ && !window.__RETRY_FUNCTION__.__patched) {
+                        const originalRetry = window.__RETRY_FUNCTION__;
+                        window.__RETRY_FUNCTION__ = async function(message, options) {
+                            return originalRetry(message, options);
+                        };
+                        window.__RETRY_FUNCTION__.__patched = true;
+                        this.patchedRetry = window.__RETRY_FUNCTION__;
+                        return true;
+                    }
+                } catch (e) {
+                    // Ignore errors
+                }
+                return false;
+            };
+
+            const intervalId = setInterval(() => {
+                if (tryPatch()) {
+                    clearInterval(intervalId);
+                }
+            }, 200);
+        }
+
+        async concurrentRetry(message) {
+            if (this.patchedRetry) {
+                await this.patchedRetry(message);
+            } else {
+                // Fallback: click refresh button
+                this.navigation.refreshActiveMsg();
+            }
         }
 
         init() {
@@ -608,7 +685,7 @@
             if (best.value && best.selectionStart !== undefined) best.selectionStart = best.value.length;
         }
 
-        handleKey(e) {
+        async handleKey(e) {
             let cancelledEdit = false; // Flag to track if Escape cancelled an edit
 
             // --- ESCAPE HANDLING ---
@@ -620,13 +697,13 @@
                 if (activeMsgContainer && act.matches('textarea, [contenteditable]')) {
                     // Enhanced Cancel Button Finder with multiple strategies
                     let cancelBtn = null;
-
+                    
                     // Strategy 1: Look for buttons with "Cancel" text or aria-label
                     const buttonsInMsg = Array.from(activeMsgContainer.querySelectorAll('button, [role="button"][type="button"], [type="button"]'));
-                    cancelBtn = buttonsInMsg.find(btn =>
+                    cancelBtn = buttonsInMsg.find(btn => 
                         /cancel/i.test(btn.textContent || btn.innerText || btn.getAttribute('aria-label') || '')
                     );
-
+                    
                     // Strategy 2: Look for buttons that appear during edit mode (often positioned near the textarea)
                     if (!cancelBtn) {
                         const editControls = act.closest('div')?.nextElementSibling;
@@ -636,7 +713,7 @@
                             cancelBtn = controlButtons[0];
                         }
                     }
-
+                    
                     // Strategy 3: Look for buttons with specific classes that might indicate cancel functionality
                     if (!cancelBtn) {
                         cancelBtn = activeMsgContainer.querySelector('button[class*="cancel" i], button[class*="secondary" i]');
@@ -644,20 +721,20 @@
 
                     if (cancelBtn) {
                         const msgToKeepSelected = activeMsgContainer;
-
+                        
                         // Determine current scroll position relative to the message
                         const msgRect = activeMsgContainer.getBoundingClientRect();
                         const viewportHeight = window.innerHeight;
                         const msgCenter = msgRect.top + (msgRect.height / 2);
                         const isAboveHalfway = msgCenter < (viewportHeight / 2);
-
+                        
                         cancelBtn.click();
-
+                        
                         // Re-highlight the same message after cancelling edit with smart scrolling
                         setTimeout(() => {
                             if (msgToKeepSelected && document.body.contains(msgToKeepSelected)) {
-                                this.navigation.highlightMsg(msgToKeepSelected, {
-                                    scrollIntoView: true,
+                                this.navigation.highlightMsg(msgToKeepSelected, { 
+                                    scrollIntoView: true, 
                                     force: true,
                                     // If above halfway point, scroll to top; otherwise scroll to bottom
                                     scrollTop: isAboveHalfway,
@@ -668,7 +745,7 @@
                                 this.navigation.scrollContainer.focus({ preventScroll: true });
                             }
                         }, 50); // Short delay
-
+                        
                         cancelledEdit = true; // Set the flag
                         e.preventDefault();
                         return; // Stop further Escape processing for this event
@@ -743,8 +820,27 @@
                 // --- Refresh selected message ---
                 case 'r':
                     if (this.navigation.highlighted) {
-                        this.navigation.refreshActiveMsg();
-                        handled = true;
+                        // Find the retry button in the highlighted message
+                        const retryBtn = this.navigation.highlighted.querySelector('button[aria-label="Retry"], button[title="Retry"], button[aria-label*="Retry"], button[title*="Retry"]');
+                        if (retryBtn) {
+                            // If disabled, temporarily enable it to allow click
+                            const wasDisabled = retryBtn.disabled;
+                            if (wasDisabled) {
+                                retryBtn.disabled = false;
+                            }
+                            retryBtn.click();
+                            if (wasDisabled) {
+                                // Restore disabled state after click
+                                setTimeout(() => {
+                                    retryBtn.disabled = true;
+                                }, 100);
+                            }
+                            handled = true;
+                        } else {
+                            // Fallback: refresh active message
+                            this.navigation.refreshActiveMsg();
+                            handled = true;
+                        }
                     }
                     break;
                 // --- Copy button for selected message ---
@@ -814,36 +910,36 @@
 
                         if (editBtn) {
                             const msgContainer = this.navigation.highlighted;
-
+                            
                             // Store a reference to the message before clicking
                             const msgId = msgContainer.dataset.ormsgid;
-
+                            
                             // Set up a MutationObserver to detect when the textarea appears
                             let editObserver = null;
                             const setupObserver = () => {
                                 if (editObserver) return; // Only set up once
-
+                                
                                 const currentMsg = document.querySelector(`[data-ormsgid="${msgId}"]`);
                                 if (!currentMsg) return;
-
+                                
                                 editObserver = new MutationObserver((mutations, observer) => {
                                     for (const mutation of mutations) {
                                         if (mutation.type === 'childList' || mutation.type === 'subtree') {
                                             const editableSelectors = [
-                                                'textarea',
-                                                '[contenteditable="true"]',
+                                                'textarea', 
+                                                '[contenteditable="true"]', 
                                                 '[contenteditable]',
                                                 'div[role="textbox"]',
                                                 '.ProseMirror',
                                                 '[data-slate-editor]'
                                             ];
-
+                                            
                                             for (const selector of editableSelectors) {
                                                 const editArea = currentMsg.querySelector(selector);
                                                 if (editArea) {
                                                     // Focus immediately when detected
                                                     editArea.focus();
-
+                                                    
                                                     // Move cursor to the end
                                                     if (editArea.setSelectionRange) {
                                                         const len = editArea.value.length;
@@ -861,7 +957,7 @@
                                                             editArea.focus();
                                                         }
                                                     }
-
+                                                    
                                                     // Disconnect after successful focus
                                                     observer.disconnect();
                                                     editObserver = null;
@@ -871,15 +967,15 @@
                                         }
                                     }
                                 });
-
+                                
                                 // Observe the message container for changes
-                                editObserver.observe(currentMsg, {
-                                    childList: true,
+                                editObserver.observe(currentMsg, { 
+                                    childList: true, 
                                     subtree: true,
                                     attributes: true,
                                     characterData: true
                                 });
-
+                                
                                 // Set a timeout to disconnect the observer if it doesn't find anything
                                 setTimeout(() => {
                                     if (editObserver) {
@@ -888,38 +984,38 @@
                                     }
                                 }, 3000); // 3 second timeout
                             };
-
+                            
                             // Click the edit button
                             editBtn.click();
-
+                            
                             // Set up the observer immediately
                             setupObserver();
-
+                            
                             // Also use our previous approach with multiple attempts as a fallback
                             const focusEditArea = (attempt = 1) => {
                                 const currentMsg = document.querySelector(`[data-ormsgid="${msgId}"]`);
                                 if (!currentMsg) return;
-
+                                
                                 const editableSelectors = [
-                                    'textarea',
-                                    '[contenteditable="true"]',
+                                    'textarea', 
+                                    '[contenteditable="true"]', 
                                     '[contenteditable]',
                                     'div[role="textbox"]',
                                     '.ProseMirror',
                                     '[data-slate-editor]'
                                 ];
-
+                                
                                 let editArea = null;
                                 for (const selector of editableSelectors) {
                                     editArea = currentMsg.querySelector(selector);
                                     if (editArea) break;
                                 }
-
+                                
                                 if (editArea) {
                                     // Focus with a slight delay to ensure the element is ready
                                     setTimeout(() => {
                                         editArea.focus();
-
+                                        
                                         // Move cursor to the end
                                         if (editArea.setSelectionRange) {
                                             const len = editArea.value.length;
@@ -942,16 +1038,16 @@
                                     setTimeout(() => focusEditArea(attempt + 1), Math.pow(2, attempt) * 50);
                                 }
                             };
-
+                            
                             // Try to focus immediately
                             focusEditArea(1);
-
+                            
                             // And also after a short delay
                             setTimeout(() => focusEditArea(2), 100);
-
+                            
                             // And after a longer delay as a last resort
                             setTimeout(() => focusEditArea(3), 300);
-
+                            
                             handled = true;
                         }
                     }
@@ -971,7 +1067,7 @@
         const ui = new UIModule();
         const navigation = new NavigationModule();
         const hotkeys = new HotkeyModule(settings, navigation, ui);
-
+        
         // Setup modules
         settings.init();
 
